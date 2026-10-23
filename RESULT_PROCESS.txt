@@ -1,0 +1,10 @@
+Errors Found :
+============
+Log file #1 :
+	CRITICAL errors : 206
+	ERROR errors : 251
+	FAILED_LOGIN errors : 85
+Log file #2 :
+	CRITICAL errors : 206
+	ERROR errors : 251
+	FAILED_LOGIN errors : 85
