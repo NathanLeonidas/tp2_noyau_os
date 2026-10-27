@@ -1,81 +1,311 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <string.h>
+#include <time.h>
 #include <pthread.h>
-#include "../utils/timer.h"
 
-#define BUFFER_SIZE 4096
-
-typedef struct {
-    int critical;
-    int error;
-    int failed;
-} Result;
+#define OUTFILE_NAME "RESULT_PROCESS.txt"
+#define TRUE 1
+#define FALSE 0
 
 typedef struct {
-    int fd;
-    int thread_id;
-    int nthreads;
-    int n_blocks;
-    off_t block_size;
-    off_t filesize;
-    Result total;
-} PoolArgs;
+	int		file[2];
+	int 	n;
+} proc_args_t;
 
-/* TODO */
-void *pool_worker(void *arg) {
-    PoolArgs *a = (PoolArgs *)arg;
-    (void)a;
-    return NULL;
-}
-
-/* TODO  */
-void process_file_pool(const char *filename, int n_blocks, int nthreads,
-                        int *crit_total, int *err_total, int *fail_total) {
-    (void)filename; (void)n_blocks; (void)nthreads;
-    (void)crit_total; (void)err_total; (void)fail_total;
-}
 
 typedef struct {
-    const char *log1;
-    const char *log2;
-    int n_blocks;
-    int nthreads;
-} pool_args_t;
+	int 	logno;
+	int 	errnums[3];
+} proc_mesg_t;
 
-/* TODO */
-void pool_task_wrapper(void *arg) {
-    (void)arg;
+typedef struct {
+	proc_args_t *args;
+	proc_mesg_t *shm;
+	int ch_id;
+} thread_args_t;
+
+
+const size_t 		numerrtype = 3;
+const char* const 	err_strs[]  = {"CRITICAL", "ERROR", "FAILED_LOGIN", 0};
+
+static int _erroranddie(int cond, const char *fname, int exittype);
+static void _searchbuferrs(proc_mesg_t *shm, int ch_id, char *buf, size_t bufsize);
+static void *_childproc(void *compact_args);
+static void _process_task_wrapper(proc_args_t *args);
+
+pthread_mutex_t pool_mutex;
+int block_id;
+/*** static int _erroranddie(int cond, const char *fname, int exittype);
+Purpose: check if cond true, then perror out and exit with exittype
+Returns: cond
+*/
+static int _erroranddie(int cond, const char *fname, int exittype) {
+	if (cond) {
+		perror(fname);
+		exit(exittype);
+	}
+	return cond;
 }
 
+
+/*** static void _searchbuferrs(proc_mesg_t *shm, int ch_id, char *buf, size_t bufsize);
+Purpose: search buf for errors and tally them in shm at offset ch_id
+*/
+static void _searchbuferrs(proc_mesg_t *shm, int ch_id, char *buf, size_t bufsize) {
+	const size_t 		err_strln[] = {strlen(err_strs[0]), strlen(err_strs[1]),
+									   strlen(err_strs[2]), 0};
+	
+	size_t bufleftlen;
+	char *offs, *endoffs;
+	unsigned int i;
+	
+	
+	for (i = 0; i < numerrtype; ++i) {
+		offs = buf;
+		bufleftlen = bufsize;
+		endoffs = buf + bufsize;
+		while (offs < endoffs) {
+			offs = memmem(offs, bufleftlen, err_strs[i], err_strln[i]);
+			if (offs != NULL) {
+				shm[ch_id].errnums[i]++;
+				offs += err_strln[i];
+				bufleftlen = (size_t)(endoffs-offs);
+			} else
+				break;
+		}
+	}
+	
+}
+
+
+
+/*** static void _childproc(proc_args_t *args, proc_mesg_t *shm, int ch_id)
+Purpose: child process entry point, calculates start/end offs and 
+			sets up buffer 
+*/
+const size_t buffer_pad = 4096;
+static void *_childproc(void *args_compact) {
+	/* unwrap the args into proper types */
+	thread_args_t *thread_args = (thread_args_t *) args_compact;
+	proc_args_t *args = thread_args->args;
+	proc_mesg_t *shm = thread_args->shm;
+	int ch_id = thread_args->ch_id;
+
+	/*continue with the same logic as before*/
+	int file, o;
+	size_t fsize, oldstartoffs, startoffs, endoffs, endoffspad, blocksize;
+	char *buf;
+	
+	file = args->file[ch_id & 1];
+	shm[ch_id].logno = ch_id & 1;
+	
+	fsize = lseek(file, 0, SEEK_END);
+	
+	blocksize = fsize / (args->n);
+	startoffs = blocksize * (ch_id >> 1);
+	oldstartoffs = startoffs;
+	endoffs = startoffs + blocksize >= fsize ? fsize : startoffs + blocksize;
+	endoffspad = endoffs + buffer_pad >= fsize ? fsize : endoffs + buffer_pad;
+	
+	buf = calloc(endoffspad-startoffs, sizeof(char));
+	_erroranddie(buf == NULL, "calloc", EXIT_FAILURE);
+	
+	o = pread(file, buf, sizeof(char)*(endoffspad-startoffs), startoffs);
+	_erroranddie(o <= 0, "pread", EXIT_FAILURE);
+	
+	/* align start to file start, file end or \n */
+	if (startoffs != 0) {
+		while (TRUE) {
+			if (buf[startoffs-oldstartoffs] == '\n' || startoffs >= endoffspad)
+				break;
+			else
+				++startoffs;
+		}
+	}
+	
+	/* nothing to do */
+	if (startoffs >= fsize-1)
+		return NULL;
+	
+	/* do the same for end */
+	if (endoffs < endoffspad - 1) {
+		while (TRUE) {
+			if (buf[endoffs-oldstartoffs] == '\n' || endoffs >= endoffspad) {
+				++endoffs;
+				break;
+			} else
+				++endoffs;
+		}
+	}
+	
+	
+	_searchbuferrs(shm, ch_id, buf+startoffs-oldstartoffs, endoffs-startoffs);
+	
+	fflush(stdout);
+	free(buf);
+
+	return NULL;
+}
+
+
+
+/* static void thread_pool_loop creates a scheduler*/
+static void *_thread_pool_loop(void *ptr) {
+	thread_args_t args_thread;
+	args_thread.args = (*((thread_args_t *) ptr)).args;
+	args_thread.shm = (*((thread_args_t *) ptr)).shm;
+	int nproc = (*((thread_args_t *) ptr)).ch_id;
+	while (1) {
+		pthread_mutex_lock(&pool_mutex);
+		if (block_id>=nproc) { 
+			pthread_mutex_unlock(&pool_mutex);
+			return NULL;
+		}
+		block_id++;
+		args_thread.ch_id = block_id;
+		pthread_mutex_unlock(&pool_mutex);
+		_childproc((void *) &args_thread);
+	}
+}
+
+
+
+/*** static void _process_task_wrapper(proc_args_t *args)
+Purpose : high level program logic, create children and count their findings
+*/
+static void _process_task_wrapper(proc_args_t *args) {
+	int shm_fd, i, nproc, outfile, oldstdout;
+	unsigned int j;
+	size_t shm_size;
+	const char *shm_name = "/sharedmem";
+	proc_mesg_t *shm;
+	pthread_t *tids;
+	proc_mesg_t *errs;
+	
+	
+	nproc = args->n * 2;
+	shm_size = sizeof(proc_mesg_t) * nproc;
+	
+	shm_fd = shm_open(shm_name, O_RDWR | O_TRUNC | O_CREAT, 0x1b6);
+	_erroranddie(shm_fd < 0, "shm_open", EXIT_FAILURE);
+	ftruncate(shm_fd, shm_size);
+	shm = (proc_mesg_t*) mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	_erroranddie(shm == NULL, "mmap", EXIT_FAILURE);
+	
+	int M = 5;
+	block_id = -1;
+	tids = calloc(M, sizeof(pthread_t));
+	_erroranddie(tids == NULL, "calloc", EXIT_FAILURE);
+
+	pthread_mutex_init(&pool_mutex, NULL);
+	thread_args_t args_pool[M];
+	/* launch M threads inside a pool */
+	for (i = 0; i < M; ++i) {
+		args_pool[i].shm = shm;
+		args_pool[i].args = args;
+		args_pool[i].ch_id = nproc; /* this is improper we should've created a specific struct */
+		int ret = pthread_create(&tids[i], NULL, _thread_pool_loop, (void *) &args_pool[i]);
+		_erroranddie((ret!=0), "thread creation", EXIT_FAILURE);
+		
+	}
+	
+	/* wait for all nproc children to die */
+	for (i = 0; i < M; ++i) {
+		int ret = pthread_join(tids[i], NULL);
+
+		_erroranddie((ret!=0), "waiting thread failed", EXIT_FAILURE);
+	}
+
+	/* tally up all errors and stuffs found */
+	errs = (proc_mesg_t*) calloc(2, sizeof(proc_mesg_t));
+	_erroranddie(errs == NULL, "calloc", EXIT_FAILURE);
+	errs[0].logno = 0;
+	errs[1].logno = 1;
+	
+	for (i = 0; i < nproc; ++i) {
+		for (j = 0; j < numerrtype; ++j) 
+			errs[shm[i].logno].errnums[j]	+= shm[i].errnums[j];
+	}
+	fflush(stdout);
+	
+	outfile = open("./"OUTFILE_NAME, O_WRONLY | O_TRUNC | O_CREAT, 0x1b6);
+	_erroranddie(outfile < 0, "open", EXIT_FAILURE);
+	
+	oldstdout = dup(STDOUT_FILENO);
+	dup2(outfile, STDOUT_FILENO);
+	printf("Errors Found :\n============\n");
+	for (i = 0; i < 2; ++i) {
+		printf("Log file #%i :\n", i+1);
+		for (j = 0; j < numerrtype; ++j)  {
+			printf("\t%s errors : %i\n", err_strs[j], errs[i].errnums[j]);
+		}
+	}
+	fflush(stdout);
+	close(outfile);
+	dup2(oldstdout, STDOUT_FILENO);
+	
+	for (i = 0; i < M; ++i) {
+		printf("Thread #%i TID : %li\n", i, tids[i]);
+	}
+	fflush(stdout);
+	
+	munmap((void*) shm, sizeof(proc_mesg_t) * nproc);
+	close(shm_fd);
+	shm_unlink(shm_name);
+}
+/*** int main(int argc, char *argv[])
+Purpose : entry point
+*/
 int main(int argc, char *argv[]) {
-    if (argc != 5) {
-        printf("Usage: %s <log1> <log2> <N_BLOCS> <N_THREADS>\n", argv[0]);
-        return 1;
-    }
+	int i;
+	long dt, dnt;
+	float t;
+	struct timespec start, end;
+	
+	if (argc != 4) {
+		fprintf(stderr, "Usage: %s <log1> <log2> <N>\n", argv[0]);
+		exit(EXIT_FAILURE);
+	}
 
-    pool_args_t args;
-    args.log1 = argv[1];
-    args.log2 = argv[2];
-    args.n_blocks = atoi(argv[3]);
-    args.nthreads = atoi(argv[4]);
+	proc_args_t args;
+	args.n = atoi(argv[3]);
 
-    if (args.nthreads < 1) {
-        fprintf(stderr, "N_THREADS doit être >= 1\n");
-        return 1;
-    }
-    if (args.n_blocks < 1) {
-        fprintf(stderr, "N_BLOCS doit être >= 1\n");
-        return 1;
-    }
+	if (args.n < 1) {
+		fprintf(stderr, "Bad n value, n=%i < 1", args.n); 
+		exit(EXIT_FAILURE);
+	}
 
-    system("mkdir -p bin");
-
-    double elapsed = measure_time(pool_task_wrapper, &args);
-    printf("Temps d'exécution (pool de %d threads, %d blocs) = %.6f secondes\n",
-           args.nthreads, args.n_blocks, elapsed);
-
-    return 0;
+	fflush(stdout); 
+	
+	/* check for file validity first */
+	for (i = 0; i < 2; ++i) {
+		args.file[i] = open(argv[i+1], O_RDONLY);
+		_erroranddie(args.file[i] < 0, "open", EXIT_FAILURE);
+	}
+	
+	
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	 
+	_process_task_wrapper(&args);
+	
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	
+	dt  = end.tv_sec - start.tv_sec;
+    dnt = end.tv_nsec - start.tv_nsec;
+	
+	t = (float) dt + (float) dnt / 1e9f;
+	
+	printf("Execution time : %fs", t);
+	
+	for (i = 0; i < 2; ++i) 
+		close(args.file[i]);
+	
+	return 0;
 }
