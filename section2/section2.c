@@ -199,25 +199,28 @@ static void _process_task_wrapper(proc_args_t *args) {
 	shm = (proc_mesg_t*) mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 	_erroranddie(shm == NULL, "mmap", EXIT_FAILURE);
 	
-	int M = 5;
-	block_id = -1;
-	tids = calloc(M, sizeof(pthread_t));
+	// Code that changes in this vesion below
+	int n_threads_in_pool = 10; // threads in the pool
+	block_id = -1; // counter initialized at -1 because it will get incremented
+
+	tids = calloc(n_threads_in_pool, sizeof(pthread_t));
 	_erroranddie(tids == NULL, "calloc", EXIT_FAILURE);
 
 	pthread_mutex_init(&pool_mutex, NULL);
-	thread_args_t args_pool[M];
-	/* launch M threads inside a pool */
-	for (i = 0; i < M; ++i) {
+	thread_args_t args_pool[n_threads_in_pool];
+
+	/* launch threads inside a pool */
+	for (i = 0; i < n_threads_in_pool; ++i) {
 		args_pool[i].shm = shm;
 		args_pool[i].args = args;
-		args_pool[i].ch_id = nproc; /* this is improper we should've created a specific struct */
+		args_pool[i].ch_id = nproc; /* this is improper we should've created a specific struct but it works */
 		int ret = pthread_create(&tids[i], NULL, _thread_pool_loop, (void *) &args_pool[i]);
 		_erroranddie((ret!=0), "thread creation", EXIT_FAILURE);
 		
 	}
 	
-	/* wait for all nproc children to die */
-	for (i = 0; i < M; ++i) {
+	/* wait for all threads to die */
+	for (i = 0; i < n_threads_in_pool; ++i) {
 		int ret = pthread_join(tids[i], NULL);
 
 		_erroranddie((ret!=0), "waiting thread failed", EXIT_FAILURE);
@@ -251,7 +254,7 @@ static void _process_task_wrapper(proc_args_t *args) {
 	close(outfile);
 	dup2(oldstdout, STDOUT_FILENO);
 	
-	for (i = 0; i < M; ++i) {
+	for (i = 0; i < n_threads_in_pool; ++i) {
 		printf("Thread #%i TID : %li\n", i, tids[i]);
 	}
 	fflush(stdout);

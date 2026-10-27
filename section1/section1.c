@@ -177,7 +177,7 @@ static void _process_task_wrapper(proc_args_t *args) {
 	_erroranddie(tids == NULL, "calloc", EXIT_FAILURE);
 	thread_args_t args_thread[nproc];
 
-	/* fork children */
+	/* create one thread per block */
 	for (i = 0; i < nproc; ++i) {
 		args_thread[i].args = args;
 		args_thread[i].shm = shm;
